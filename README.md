@@ -1,60 +1,44 @@
-# Private Telegram Ad Bot — Full Version
+# Declarant Admin Panel v2
 
-Features:
+Функции:
+- только Mini App и админ-панель, без команд;
+- создание кампаний с источником и меткой конкретного объявления;
+- топ кампаний по конверсии;
+- уведомления о вступлениях и выходах;
+- чёрный список;
+- пользователь, удалённый администратором из канала, автоматически блокируется;
+- заблокированному пользователю бот не показывает сообщения и не создаёт новые ссылки;
+- один Telegram ID получает доступ только один раз;
+- защита от пересылки приглашений;
+- автоматический отзыв старых ссылок;
+- PostgreSQL и CSV-экспорт.
 
-- Access only from approved advertising deep links.
-- One Telegram account = one access.
-- Join-request protection against forwarded invite links.
-- Automatic approval only for the intended Telegram user.
-- Bot deletes its button message and the user's `/start` after successful joining.
-- No “Access granted” message.
-- Automatic revocation of expired invite links.
-- Campaign statistics for 1 hour, 24 hours, and all time.
-- Tracks successful joins, currently active tracked members, and departures.
+## Render Environment
 
-## Advertising links
-
-Set:
-
-`ALLOWED_START_KEYS=fb_1,fb_2,tiktok_1`
-
-Use:
-
-- `https://t.me/rbsalebot?start=fb_1`
-- `https://t.me/rbsalebot?start=fb_2`
-- `https://t.me/rbsalebot?start=tiktok_1`
-
-## Statistics
-
-Send `/stats` from the Telegram account whose ID is set in `ADMIN_USER_ID`.
-
-Buttons allow selecting:
-
-- 1 hour
-- 24 hours
-- All time
-
-## Render environment variables
-
-- `BOT_TOKEN`
-- `CHANNEL_ID=-1001322091992`
-- `ADMIN_USER_ID=640314234`
-- `WEBHOOK_SECRET`
-- `ALLOWED_START_KEYS=fb_1,fb_2,tiktok_1`
-- `LINK_TTL_SECONDS=600`
-- `CLEANUP_INTERVAL_SECONDS=600`
-- `DB_PATH=/tmp/bot.db`
+BOT_TOKEN
+BOT_USERNAME=rbsalebot
+CHANNEL_ID=-1001322091992
+ADMIN_USER_ID=640314234
+WEBHOOK_SECRET=<длинная случайная строка>
+DATABASE_URL=<Internal Database URL PostgreSQL>
+LINK_TTL_SECONDS=600
+CLEANUP_INTERVAL_SECONDS=600
 
 Build:
-
-`pip install -r requirements.txt`
+pip install -r requirements.txt
 
 Start:
+uvicorn app:app --host 0.0.0.0 --port $PORT
 
-`uvicorn main:app --host 0.0.0.0 --port $PORT`
+## BotFather
 
-## Important
+Настрой Main Mini App:
+@BotFather → бот → Bot Settings → Configure Mini App / Main Mini App
 
-The bot must remain an administrator of the channel and must receive `chat_member` updates.
+URL:
+https://ТВОЙ-СЕРВИС.onrender.com
 
-Render's `/tmp` storage is temporary. A restart or redeploy can erase statistics. For reliable long-term data, use PostgreSQL or a persistent disk.
+Также настрой Menu Button на тот же URL. Тогда админ-панель открывается кнопкой меню в профиле бота, без команд.
+
+Рекламные ссылки создаются внутри панели:
+https://t.me/rbsalebot?startapp=campaign_key
