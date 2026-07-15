@@ -1,37 +1,60 @@
-# Private Telegram Ad Bot
+# Private Telegram Ad Bot — Full Version
 
-This bot only works through approved Telegram deep links from ads.
+Features:
 
-## Example ad link
+- Access only from approved advertising deep links.
+- One Telegram account = one access.
+- Join-request protection against forwarded invite links.
+- Automatic approval only for the intended Telegram user.
+- Bot deletes its button message and the user's `/start` after successful joining.
+- No “Access granted” message.
+- Automatic revocation of expired invite links.
+- Campaign statistics for 1 hour, 24 hours, and all time.
+- Tracks successful joins, currently active tracked members, and departures.
 
-`https://t.me/rbsalebot?start=fb_by_2026`
+## Advertising links
 
-## Render settings
+Set:
 
-Create a **Web Service** from this repository.
+`ALLOWED_START_KEYS=fb_1,fb_2,tiktok_1`
 
-- Runtime: Python
-- Build command: `pip install -r requirements.txt`
-- Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+Use:
 
-Environment variables:
+- `https://t.me/rbsalebot?start=fb_1`
+- `https://t.me/rbsalebot?start=fb_2`
+- `https://t.me/rbsalebot?start=tiktok_1`
 
-- `BOT_TOKEN` — token copied from BotFather
-- `CHANNEL_ID` — `-1001322091992`
-- `WEBHOOK_SECRET` — a long random string using letters, digits, `_` or `-`
-- `ALLOWED_START_KEYS` — `fb_by_2026`
-- `LINK_TTL_SECONDS` — `600`
-- `DB_PATH` — `/tmp/bot.db`
+## Statistics
 
-For several campaigns:
+Send `/stats` from the Telegram account whose ID is set in `ADMIN_USER_ID`.
 
-`ALLOWED_START_KEYS=fb_by_2026,tiktok_by_2026,facebook_test2`
+Buttons allow selecting:
 
-Then use:
+- 1 hour
+- 24 hours
+- All time
 
-- `https://t.me/rbsalebot?start=fb_by_2026`
-- `https://t.me/rbsalebot?start=tiktok_by_2026`
+## Render environment variables
 
-The bot must be an administrator of the private channel with permission to invite users and approve join requests.
+- `BOT_TOKEN`
+- `CHANNEL_ID=-1001322091992`
+- `ADMIN_USER_ID=640314234`
+- `WEBHOOK_SECRET`
+- `ALLOWED_START_KEYS=fb_1,fb_2,tiktok_1`
+- `LINK_TTL_SECONDS=600`
+- `CLEANUP_INTERVAL_SECONDS=600`
+- `DB_PATH=/tmp/bot.db`
 
-Important: Render's local filesystem can be reset after redeploys/restarts. For permanent history and reliable one-user-only tracking, connect a persistent disk or external database.
+Build:
+
+`pip install -r requirements.txt`
+
+Start:
+
+`uvicorn main:app --host 0.0.0.0 --port $PORT`
+
+## Important
+
+The bot must remain an administrator of the channel and must receive `chat_member` updates.
+
+Render's `/tmp` storage is temporary. A restart or redeploy can erase statistics. For reliable long-term data, use PostgreSQL or a persistent disk.
