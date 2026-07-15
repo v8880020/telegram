@@ -6,16 +6,16 @@ import io
 import json
 import os
 import re
+import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import parse_qsl
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, Integer, String, Text, func, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import declarative_base
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 BOT_USERNAME = os.getenv("BOT_USERNAME", "rbsalebot").lstrip("@")
@@ -23,77 +23,90 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1001322091992"))
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "640314234"))
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 BASE_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
-DATABASE_URL = os.environ["DATABASE_URL"].replace("postgres://", "postgresql+asyncpg://", 1).replace(
-    "postgresql://", "postgresql+asyncpg://", 1
-)
 LINK_TTL_SECONDS = int(os.getenv("LINK_TTL_SECONDS", "600"))
-CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "600"))
+CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "300"))
+DB_PATH = os.getenv("DB_PATH", "/tmp/declarant.sqlite3")
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-Base = declarative_base()
-engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
-Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 app = FastAPI()
-tasks: list[asyncio.Task] = []
+background_tasks: list[asyncio.Task] = []
 
 
-class Campaign(Base):
-    __tablename__ = "campaigns"
-    key = Column(String(64), primary_key=True)
-    source = Column(String(32), nullable=False)
-    ad_label = Column(String(80), nullable=False)
-    created_at = Column(DateTime(timezone=True), nullable=False)
-    created_by = Column(BigInteger, nullable=False)
-    active = Column(Boolean, nullable=False, default=True)
+@contextmanager
+def db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB_PATH, timeout=30)
+    connection.row_factory = sqlite3.Row
+    try:
+        yield connection
+        connection.commit()
+    finally:
+        connection.close()
 
 
-class User(Base):
-    __tablename__ = "users"
-    user_id = Column(BigInteger, primary_key=True)
-    username = Column(String(128))
-    first_name = Column(String(128))
-    language_code = Column(String(16))
-    campaign = Column(String(64))
-    first_seen_at = Column(DateTime(timezone=True))
-    approved_at = Column(DateTime(timezone=True))
-    left_at = Column(DateTime(timezone=True))
-    active = Column(Boolean, nullable=False, default=False)
-    blocked = Column(Boolean, nullable=False, default=False)
-    blocked_at = Column(DateTime(timezone=True))
-    block_reason = Column(String(64))
+def now_ts() -> int:
+    return int(time.time())
 
 
-class BotStart(Base):
-    __tablename__ = "bot_starts"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(BigInteger, nullable=False)
-    campaign = Column(String(64))
-    started_at = Column(DateTime(timezone=True), nullable=False)
-    username = Column(String(128))
-    first_name = Column(String(128))
-    language_code = Column(String(16))
+def init_db() -> None:
+    with db() as connection:
+        connection.executescript(
+            """
+            PRAGMA journal_mode=WAL;
 
+            CREATE TABLE IF NOT EXISTS campaigns (
+                key TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                ad_label TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            );
 
-class AccessLink(Base):
-    __tablename__ = "access_links"
-    invite_link = Column(Text, primary_key=True)
-    user_id = Column(BigInteger, nullable=False)
-    campaign = Column(String(64), nullable=False)
-    created_at = Column(DateTime(timezone=True), nullable=False)
-    expires_at = Column(DateTime(timezone=True), nullable=False)
-    used = Column(Boolean, nullable=False, default=False)
-    revoked = Column(Boolean, nullable=False, default=False)
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                language_code TEXT,
+                campaign TEXT,
+                first_seen_at INTEGER,
+                approved_at INTEGER,
+                left_at INTEGER,
+                active INTEGER NOT NULL DEFAULT 0,
+                blocked INTEGER NOT NULL DEFAULT 0,
+                blocked_at INTEGER,
+                block_reason TEXT
+            );
 
+            CREATE TABLE IF NOT EXISTS bot_starts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                campaign TEXT,
+                started_at INTEGER NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                language_code TEXT
+            );
 
-class Settings(Base):
-    __tablename__ = "settings"
-    id = Column(Integer, primary_key=True, default=1)
-    notify_joins = Column(Boolean, nullable=False, default=True)
-    notify_leaves = Column(Boolean, nullable=False, default=True)
+            CREATE TABLE IF NOT EXISTS access_links (
+                invite_link TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                campaign TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                revoked INTEGER NOT NULL DEFAULT 0
+            );
 
+            CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                notify_joins INTEGER NOT NULL DEFAULT 1,
+                notify_leaves INTEGER NOT NULL DEFAULT 1
+            );
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+            INSERT OR IGNORE INTO settings(id, notify_joins, notify_leaves)
+            VALUES (1, 1, 1);
+            """
+        )
 
 
 async def telegram(method: str, payload: dict | None = None) -> dict:
@@ -105,62 +118,75 @@ async def telegram(method: str, payload: dict | None = None) -> dict:
     return data["result"]
 
 
-def validate_init_data(init_data: str, max_age: int = 3600) -> dict:
+def validate_init_data(init_data: str, max_age_seconds: int = 3600) -> dict:
     if not init_data:
-        raise HTTPException(401, "Telegram initData отсутствует")
+        raise HTTPException(status_code=401, detail="Telegram initData отсутствует")
+
     pairs = dict(parse_qsl(init_data, keep_blank_values=True))
     received_hash = pairs.pop("hash", None)
     if not received_hash:
-        raise HTTPException(401, "Telegram hash отсутствует")
-    auth_date = int(pairs.get("auth_date", "0"))
-    if abs(int(time.time()) - auth_date) > max_age:
-        raise HTTPException(401, "Сессия Telegram устарела")
-    check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
-    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-    calculated = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(calculated, received_hash):
-        raise HTTPException(401, "Неверная подпись Telegram")
+        raise HTTPException(status_code=401, detail="Telegram hash отсутствует")
+
+    try:
+        auth_date = int(pairs.get("auth_date", "0"))
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Некорректный auth_date") from exc
+
+    if abs(now_ts() - auth_date) > max_age_seconds:
+        raise HTTPException(status_code=401, detail="Сессия Telegram устарела")
+
+    data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(pairs.items()))
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calculated_hash = hmac.new(
+        secret_key,
+        data_check_string.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(calculated_hash, received_hash):
+        raise HTTPException(status_code=401, detail="Неверная подпись Telegram")
+
+    try:
+        user = json.loads(pairs.get("user", "{}"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=401, detail="Некорректные данные пользователя") from exc
+
     return {
-        "user": json.loads(pairs.get("user", "{}")),
+        "user": user,
         "start_param": pairs.get("start_param", ""),
     }
 
 
 def require_admin(data: dict) -> None:
     if int(data["user"].get("id", 0)) != ADMIN_USER_ID:
-        raise HTTPException(403, "Только для администратора")
+        raise HTTPException(status_code=403, detail="Доступ только для администратора")
 
 
 @app.on_event("startup")
 async def startup() -> None:
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    async with Session() as session:
-        if not await session.get(Settings, 1):
-            session.add(Settings(id=1, notify_joins=True, notify_leaves=True))
-            await session.commit()
-
-    await telegram("setWebhook", {
-        "url": f"{BASE_URL}/telegram/{WEBHOOK_SECRET}",
-        "secret_token": WEBHOOK_SECRET,
-        "allowed_updates": ["chat_join_request", "chat_member"],
-        "drop_pending_updates": True,
-    })
-    tasks.append(asyncio.create_task(cleanup_loop()))
+    init_db()
+    await telegram(
+        "setWebhook",
+        {
+            "url": f"{BASE_URL}/telegram/{WEBHOOK_SECRET}",
+            "secret_token": WEBHOOK_SECRET,
+            "allowed_updates": ["chat_join_request", "chat_member"],
+            "drop_pending_updates": True,
+        },
+    )
+    background_tasks.append(asyncio.create_task(cleanup_loop()))
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    for task in tasks:
+    for task in background_tasks:
         task.cancel()
-    await engine.dispose()
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
-    with open("static/index.html", "r", encoding="utf-8") as f:
-        return HTMLResponse(f.read())
+async def mini_app() -> HTMLResponse:
+    html = Path("static/index.html").read_text(encoding="utf-8")
+    return HTMLResponse(html)
 
 
 @app.get("/health")
@@ -169,69 +195,96 @@ async def health() -> dict:
 
 
 @app.post("/api/access")
-async def access(request: Request) -> dict:
+async def create_access(request: Request) -> dict:
     body = await request.json()
     data = validate_init_data(body.get("initData", ""))
     tg_user = data["user"]
     user_id = int(tg_user["id"])
     campaign_key = (data["start_param"] or body.get("campaign") or "").strip().lower()
 
-    async with Session() as session:
-        db_user = await session.get(User, user_id)
+    with db() as connection:
+        user = connection.execute(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
 
-        # Удалённые/заблокированные пользователи не получают никакого доступа.
-        if db_user and db_user.blocked:
-            return {"blocked": True}
+        if user and user["blocked"]:
+            return {"silent": True}
 
-        # Один Telegram-аккаунт — один доступ навсегда.
-        if db_user and db_user.approved_at:
-            return {"already_used": True}
+        if user and user["approved_at"]:
+            return {"silent": True}
 
-        campaign = await session.get(Campaign, campaign_key)
-        if not campaign or not campaign.active:
-            raise HTTPException(403, "Рекламная ссылка недействительна")
+        campaign = connection.execute(
+            "SELECT * FROM campaigns WHERE key = ? AND active = 1",
+            (campaign_key,),
+        ).fetchone()
+        if not campaign:
+            raise HTTPException(status_code=403, detail="Рекламная ссылка недействительна")
 
-        session.add(BotStart(
-            user_id=user_id,
-            campaign=campaign_key,
-            started_at=utcnow(),
-            username=tg_user.get("username"),
-            first_name=tg_user.get("first_name"),
-            language_code=tg_user.get("language_code"),
-        ))
+        connection.execute(
+            """
+            INSERT INTO bot_starts(
+                user_id, campaign, started_at, username, first_name, language_code
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                campaign_key,
+                now_ts(),
+                tg_user.get("username"),
+                tg_user.get("first_name"),
+                tg_user.get("language_code"),
+            ),
+        )
 
-        if not db_user:
-            db_user = User(
-                user_id=user_id,
-                campaign=campaign_key,
-                first_seen_at=utcnow(),
-                active=False,
-                blocked=False,
-            )
-            session.add(db_user)
+        connection.execute(
+            """
+            INSERT INTO users(
+                user_id, username, first_name, language_code,
+                campaign, first_seen_at, active, blocked
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                language_code = excluded.language_code
+            """,
+            (
+                user_id,
+                tg_user.get("username"),
+                tg_user.get("first_name"),
+                tg_user.get("language_code"),
+                campaign_key,
+                now_ts(),
+            ),
+        )
 
-        db_user.username = tg_user.get("username")
-        db_user.first_name = tg_user.get("first_name")
-        db_user.language_code = tg_user.get("language_code")
-        if not db_user.campaign:
-            db_user.campaign = campaign_key
-
-        expires_at = utcnow() + timedelta(seconds=LINK_TTL_SECONDS)
-        invite = await telegram("createChatInviteLink", {
+    expires_at = now_ts() + LINK_TTL_SECONDS
+    invite = await telegram(
+        "createChatInviteLink",
+        {
             "chat_id": CHANNEL_ID,
-            "name": f"{campaign_key}_{user_id}_{int(time.time())}",
-            "expire_date": int(expires_at.timestamp()),
+            "name": f"{campaign_key}_{user_id}_{now_ts()}",
+            "expire_date": expires_at,
             "creates_join_request": True,
-        })
+        },
+    )
 
-        session.add(AccessLink(
-            invite_link=invite["invite_link"],
-            user_id=user_id,
-            campaign=campaign_key,
-            created_at=utcnow(),
-            expires_at=expires_at,
-        ))
-        await session.commit()
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO access_links(
+                invite_link, user_id, campaign, created_at,
+                expires_at, used, revoked
+            ) VALUES (?, ?, ?, ?, ?, 0, 0)
+            """,
+            (
+                invite["invite_link"],
+                user_id,
+                campaign_key,
+                now_ts(),
+                expires_at,
+            ),
+        )
 
     return {"invite_link": invite["invite_link"], "expires_in": LINK_TTL_SECONDS}
 
@@ -247,48 +300,54 @@ async def create_campaign(request: Request) -> dict:
     ad_label = body.get("ad_label", "").strip()
 
     if not re.fullmatch(r"[a-z0-9_]{2,40}", key):
-        raise HTTPException(400, "Ключ: только латиница, цифры и _")
+        raise HTTPException(status_code=400, detail="Ключ: латинские буквы, цифры и _")
     if not re.fullmatch(r"[a-z0-9_]{2,30}", source):
-        raise HTTPException(400, "Источник: только латиница, цифры и _")
+        raise HTTPException(status_code=400, detail="Источник: латинские буквы, цифры и _")
     if not ad_label or len(ad_label) > 80:
-        raise HTTPException(400, "Укажи название объявления")
+        raise HTTPException(status_code=400, detail="Укажи название объявления до 80 символов")
 
-    async with Session() as session:
-        campaign = await session.get(Campaign, key)
-        if campaign:
-            campaign.active = True
-            campaign.source = source
-            campaign.ad_label = ad_label
-        else:
-            session.add(Campaign(
-                key=key,
-                source=source,
-                ad_label=ad_label,
-                created_at=utcnow(),
-                created_by=ADMIN_USER_ID,
-                active=True,
-            ))
-        await session.commit()
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO campaigns(key, source, ad_label, created_at, active)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(key) DO UPDATE SET
+                source = excluded.source,
+                ad_label = excluded.ad_label,
+                active = 1
+            """,
+            (key, source, ad_label, now_ts()),
+        )
 
-    return {"url": f"https://t.me/{BOT_USERNAME}?startapp={key}", "key": key}
+    return {
+        "key": key,
+        "url": f"https://t.me/{BOT_USERNAME}?startapp={key}",
+    }
 
 
 @app.get("/api/admin/campaigns")
-async def campaigns(x_telegram_init_data: str = Header(default="")) -> dict:
+async def list_campaigns(x_telegram_init_data: str = Header(default="")) -> dict:
     data = validate_init_data(x_telegram_init_data)
     require_admin(data)
-    async with Session() as session:
-        rows = (await session.execute(
-            select(Campaign).order_by(Campaign.created_at.desc())
-        )).scalars().all()
-    return {"campaigns": [{
-        "key": c.key,
-        "source": c.source,
-        "ad_label": c.ad_label,
-        "created_at": c.created_at.isoformat(),
-        "active": c.active,
-        "url": f"https://t.me/{BOT_USERNAME}?startapp={c.key}",
-    } for c in rows]}
+
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT * FROM campaigns ORDER BY created_at DESC"
+        ).fetchall()
+
+    return {
+        "campaigns": [
+            {
+                "key": row["key"],
+                "source": row["source"],
+                "ad_label": row["ad_label"],
+                "created_at": row["created_at"],
+                "active": bool(row["active"]),
+                "url": f"https://t.me/{BOT_USERNAME}?startapp={row['key']}",
+            }
+            for row in rows
+        ]
+    }
 
 
 @app.post("/api/admin/campaigns/{key}/toggle")
@@ -296,67 +355,120 @@ async def toggle_campaign(key: str, request: Request) -> dict:
     body = await request.json()
     data = validate_init_data(body.get("initData", ""))
     require_admin(data)
-    async with Session() as session:
-        c = await session.get(Campaign, key)
-        if not c:
-            raise HTTPException(404, "Кампания не найдена")
-        c.active = not c.active
-        await session.commit()
-        return {"active": c.active}
+
+    with db() as connection:
+        row = connection.execute(
+            "SELECT active FROM campaigns WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Кампания не найдена")
+
+        new_value = 0 if row["active"] else 1
+        connection.execute(
+            "UPDATE campaigns SET active = ? WHERE key = ?",
+            (new_value, key),
+        )
+
+    return {"active": bool(new_value)}
 
 
-async def stats_data(period_seconds: int | None) -> list[dict]:
-    since = utcnow() - timedelta(seconds=period_seconds) if period_seconds else datetime(1970,1,1,tzinfo=timezone.utc)
-    async with Session() as session:
-        campaigns = (await session.execute(
-            select(Campaign).order_by(Campaign.created_at.desc())
-        )).scalars().all()
+def build_stats(period_seconds: int | None) -> list[dict]:
+    since = now_ts() - period_seconds if period_seconds else 0
+
+    with db() as connection:
+        campaigns = connection.execute(
+            "SELECT * FROM campaigns ORDER BY created_at DESC"
+        ).fetchall()
 
         result = []
-        for c in campaigns:
-            starts = await session.scalar(select(func.count(BotStart.id)).where(
-                BotStart.campaign == c.key, BotStart.started_at >= since
-            )) or 0
-            unique = await session.scalar(select(func.count(func.distinct(BotStart.user_id))).where(
-                BotStart.campaign == c.key, BotStart.started_at >= since
-            )) or 0
-            joins = await session.scalar(select(func.count(User.user_id)).where(
-                User.campaign == c.key, User.approved_at.is_not(None), User.approved_at >= since
-            )) or 0
-            active = await session.scalar(select(func.count(User.user_id)).where(
-                User.campaign == c.key, User.active.is_(True), User.blocked.is_(False)
-            )) or 0
-            left = await session.scalar(select(func.count(User.user_id)).where(
-                User.campaign == c.key, User.left_at.is_not(None), User.left_at >= since
-            )) or 0
-            blocked = await session.scalar(select(func.count(User.user_id)).where(
-                User.campaign == c.key, User.blocked.is_(True)
-            )) or 0
+        for campaign in campaigns:
+            key = campaign["key"]
 
-            result.append({
-                "key": c.key,
-                "source": c.source,
-                "ad_label": c.ad_label,
-                "created_at": c.created_at.isoformat(),
-                "starts": int(starts),
-                "unique_users": int(unique),
-                "joins": int(joins),
-                "active_members": int(active),
-                "left": int(left),
-                "blocked": int(blocked),
-                "conversion": round((joins / unique * 100), 1) if unique else 0,
-            })
-        return result
+            starts = connection.execute(
+                """
+                SELECT COUNT(*) AS value FROM bot_starts
+                WHERE campaign = ? AND started_at >= ?
+                """,
+                (key, since),
+            ).fetchone()["value"]
+
+            unique_users = connection.execute(
+                """
+                SELECT COUNT(DISTINCT user_id) AS value FROM bot_starts
+                WHERE campaign = ? AND started_at >= ?
+                """,
+                (key, since),
+            ).fetchone()["value"]
+
+            joins = connection.execute(
+                """
+                SELECT COUNT(*) AS value FROM users
+                WHERE campaign = ? AND approved_at IS NOT NULL AND approved_at >= ?
+                """,
+                (key, since),
+            ).fetchone()["value"]
+
+            active_members = connection.execute(
+                """
+                SELECT COUNT(*) AS value FROM users
+                WHERE campaign = ? AND active = 1 AND blocked = 0
+                """,
+                (key,),
+            ).fetchone()["value"]
+
+            left = connection.execute(
+                """
+                SELECT COUNT(*) AS value FROM users
+                WHERE campaign = ? AND left_at IS NOT NULL AND left_at >= ?
+                """,
+                (key, since),
+            ).fetchone()["value"]
+
+            blocked = connection.execute(
+                """
+                SELECT COUNT(*) AS value FROM users
+                WHERE campaign = ? AND blocked = 1
+                """,
+                (key,),
+            ).fetchone()["value"]
+
+            conversion = round((joins / unique_users) * 100, 1) if unique_users else 0
+
+            result.append(
+                {
+                    "key": key,
+                    "source": campaign["source"],
+                    "ad_label": campaign["ad_label"],
+                    "created_at": campaign["created_at"],
+                    "starts": starts,
+                    "unique_users": unique_users,
+                    "joins": joins,
+                    "active_members": active_members,
+                    "left": left,
+                    "blocked": blocked,
+                    "conversion": conversion,
+                }
+            )
+
+    return result
 
 
 @app.get("/api/admin/stats")
 async def stats(period: str = "24h", x_telegram_init_data: str = Header(default="")) -> dict:
     data = validate_init_data(x_telegram_init_data)
     require_admin(data)
-    seconds = {"1h":3600, "24h":86400, "7d":604800, "all":None}.get(period, 86400)
-    rows = await stats_data(seconds)
-    top = sorted(rows, key=lambda r: (r["conversion"], r["joins"]), reverse=True)
-    return {"campaigns": rows, "top": top[:5]}
+
+    period_seconds = {
+        "1h": 3600,
+        "24h": 86400,
+        "7d": 604800,
+        "all": None,
+    }.get(period, 86400)
+
+    rows = build_stats(period_seconds)
+    top = sorted(rows, key=lambda item: (item["conversion"], item["joins"]), reverse=True)[:5]
+    return {"campaigns": rows, "top": top}
 
 
 @app.get("/api/admin/users")
@@ -364,27 +476,44 @@ async def users(q: str = "", x_telegram_init_data: str = Header(default="")) -> 
     data = validate_init_data(x_telegram_init_data)
     require_admin(data)
 
-    async with Session() as session:
-        stmt = select(User).order_by(User.first_seen_at.desc()).limit(100)
-        if q:
-            qclean = q.strip().lstrip("@")
-            if qclean.isdigit():
-                stmt = select(User).where(User.user_id == int(qclean)).limit(100)
-            else:
-                stmt = select(User).where(User.username.ilike(f"%{qclean}%")).limit(100)
-        rows = (await session.execute(stmt)).scalars().all()
+    q = q.strip().lstrip("@")
+    with db() as connection:
+        if not q:
+            rows = connection.execute(
+                "SELECT * FROM users ORDER BY first_seen_at DESC LIMIT 100"
+            ).fetchall()
+        elif q.isdigit():
+            rows = connection.execute(
+                "SELECT * FROM users WHERE user_id = ?",
+                (int(q),),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT * FROM users
+                WHERE username LIKE ?
+                ORDER BY first_seen_at DESC
+                LIMIT 100
+                """,
+                (f"%{q}%",),
+            ).fetchall()
 
-    return {"users": [{
-        "user_id": u.user_id,
-        "username": u.username,
-        "first_name": u.first_name,
-        "campaign": u.campaign,
-        "first_seen_at": u.first_seen_at.isoformat() if u.first_seen_at else None,
-        "approved_at": u.approved_at.isoformat() if u.approved_at else None,
-        "active": u.active,
-        "blocked": u.blocked,
-        "block_reason": u.block_reason,
-    } for u in rows]}
+    return {
+        "users": [
+            {
+                "user_id": row["user_id"],
+                "username": row["username"],
+                "first_name": row["first_name"],
+                "campaign": row["campaign"],
+                "first_seen_at": row["first_seen_at"],
+                "approved_at": row["approved_at"],
+                "active": bool(row["active"]),
+                "blocked": bool(row["blocked"]),
+                "block_reason": row["block_reason"],
+            }
+            for row in rows
+        ]
+    }
 
 
 @app.post("/api/admin/users/{user_id}/block")
@@ -393,15 +522,25 @@ async def block_user(user_id: int, request: Request) -> dict:
     data = validate_init_data(body.get("initData", ""))
     require_admin(data)
 
-    async with Session() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            raise HTTPException(404, "Пользователь не найден")
-        user.blocked = True
-        user.blocked_at = utcnow()
-        user.block_reason = body.get("reason", "manual")
-        user.active = False
-        await session.commit()
+    with db() as connection:
+        exists = connection.execute(
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+        connection.execute(
+            """
+            UPDATE users SET
+                blocked = 1,
+                blocked_at = ?,
+                block_reason = ?,
+                active = 0
+            WHERE user_id = ?
+            """,
+            (now_ts(), body.get("reason", "manual"), user_id),
+        )
 
     try:
         await telegram("banChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
@@ -417,18 +556,30 @@ async def unblock_user(user_id: int, request: Request) -> dict:
     data = validate_init_data(body.get("initData", ""))
     require_admin(data)
 
-    async with Session() as session:
-        user = await session.get(User, user_id)
-        if not user:
-            raise HTTPException(404, "Пользователь не найден")
-        user.blocked = False
-        user.block_reason = None
-        await session.commit()
+    with db() as connection:
+        connection.execute(
+            """
+            UPDATE users SET
+                blocked = 0,
+                blocked_at = NULL,
+                block_reason = NULL
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
 
     try:
-        await telegram("unbanChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id, "only_if_banned": True})
+        await telegram(
+            "unbanChatMember",
+            {
+                "chat_id": CHANNEL_ID,
+                "user_id": user_id,
+                "only_if_banned": True,
+            },
+        )
     except Exception:
         pass
+
     return {"ok": True}
 
 
@@ -436,9 +587,14 @@ async def unblock_user(user_id: int, request: Request) -> dict:
 async def get_settings(x_telegram_init_data: str = Header(default="")) -> dict:
     data = validate_init_data(x_telegram_init_data)
     require_admin(data)
-    async with Session() as session:
-        s = await session.get(Settings, 1)
-    return {"notify_joins": s.notify_joins, "notify_leaves": s.notify_leaves}
+
+    with db() as connection:
+        row = connection.execute("SELECT * FROM settings WHERE id = 1").fetchone()
+
+    return {
+        "notify_joins": bool(row["notify_joins"]),
+        "notify_leaves": bool(row["notify_leaves"]),
+    }
 
 
 @app.post("/api/admin/settings")
@@ -446,11 +602,19 @@ async def save_settings(request: Request) -> dict:
     body = await request.json()
     data = validate_init_data(body.get("initData", ""))
     require_admin(data)
-    async with Session() as session:
-        s = await session.get(Settings, 1)
-        s.notify_joins = bool(body.get("notify_joins"))
-        s.notify_leaves = bool(body.get("notify_leaves"))
-        await session.commit()
+
+    with db() as connection:
+        connection.execute(
+            """
+            UPDATE settings SET notify_joins = ?, notify_leaves = ?
+            WHERE id = 1
+            """,
+            (
+                1 if body.get("notify_joins") else 0,
+                1 if body.get("notify_leaves") else 0,
+            ),
+        )
+
     return {"ok": True}
 
 
@@ -458,19 +622,50 @@ async def save_settings(request: Request) -> dict:
 async def export_csv(x_telegram_init_data: str = Header(default="")) -> StreamingResponse:
     data = validate_init_data(x_telegram_init_data)
     require_admin(data)
-    async with Session() as session:
-        rows = (await session.execute(select(User).order_by(User.first_seen_at.desc()))).scalars().all()
+
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT * FROM users ORDER BY first_seen_at DESC"
+        ).fetchall()
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["telegram_id","username","first_name","campaign","first_seen","joined","left","active","blocked","block_reason"])
-    for u in rows:
-        writer.writerow([u.user_id,u.username,u.first_name,u.campaign,u.first_seen_at,u.approved_at,u.left_at,u.active,u.blocked,u.block_reason])
+    writer.writerow(
+        [
+            "telegram_id",
+            "username",
+            "first_name",
+            "language",
+            "campaign",
+            "first_seen",
+            "joined",
+            "left",
+            "active",
+            "blocked",
+            "block_reason",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row["user_id"],
+                row["username"],
+                row["first_name"],
+                row["language_code"],
+                row["campaign"],
+                row["first_seen_at"],
+                row["approved_at"],
+                row["left_at"],
+                row["active"],
+                row["blocked"],
+                row["block_reason"],
+            ]
+        )
 
     return StreamingResponse(
         iter([output.getvalue().encode("utf-8-sig")]),
         media_type="text/csv",
-        headers={"Content-Disposition":"attachment; filename=telegram_analytics.csv"},
+        headers={"Content-Disposition": "attachment; filename=telegram_analytics.csv"},
     )
 
 
@@ -481,135 +676,213 @@ async def webhook(
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ) -> JSONResponse:
     if secret != WEBHOOK_SECRET or x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-        raise HTTPException(403, "Forbidden")
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     update = await request.json()
+
     if "chat_join_request" in update:
         await handle_join_request(update["chat_join_request"])
     elif "chat_member" in update:
         await handle_chat_member(update["chat_member"])
+
     return JSONResponse({"ok": True})
 
 
-async def handle_join_request(req: dict) -> None:
-    if (req.get("chat") or {}).get("id") != CHANNEL_ID:
+async def handle_join_request(join_request: dict) -> None:
+    if (join_request.get("chat") or {}).get("id") != CHANNEL_ID:
         return
-    user = req.get("from") or {}
-    user_id = int(user["id"])
-    invite = (req.get("invite_link") or {}).get("invite_link")
-    now = utcnow()
 
-    async with Session() as session:
-        db_user = await session.get(User, user_id)
-        link = await session.get(AccessLink, invite)
+    tg_user = join_request.get("from") or {}
+    user_id = int(tg_user["id"])
+    invite_link = (join_request.get("invite_link") or {}).get("invite_link")
+    current_time = now_ts()
+
+    with db() as connection:
+        user = connection.execute(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+        link = connection.execute(
+            "SELECT * FROM access_links WHERE invite_link = ?",
+            (invite_link,),
+        ).fetchone()
 
         valid = bool(
-            db_user and not db_user.blocked and not db_user.approved_at
-            and link and link.user_id == user_id
-            and not link.used and not link.revoked and link.expires_at >= now
+            user
+            and not user["blocked"]
+            and not user["approved_at"]
+            and link
+            and link["user_id"] == user_id
+            and not link["used"]
+            and not link["revoked"]
+            and link["expires_at"] >= current_time
         )
 
-        if not valid:
-            await telegram("declineChatJoinRequest", {"chat_id": CHANNEL_ID, "user_id": user_id})
-            return
+    if not valid:
+        await telegram(
+            "declineChatJoinRequest",
+            {"chat_id": CHANNEL_ID, "user_id": user_id},
+        )
+        return
 
-        await telegram("approveChatJoinRequest", {"chat_id": CHANNEL_ID, "user_id": user_id})
-        try:
-            await telegram("revokeChatInviteLink", {"chat_id": CHANNEL_ID, "invite_link": invite})
-        except Exception:
-            pass
+    await telegram(
+        "approveChatJoinRequest",
+        {"chat_id": CHANNEL_ID, "user_id": user_id},
+    )
 
-        link.used = True
-        link.revoked = True
-        db_user.approved_at = now
-        db_user.active = True
-        db_user.left_at = None
+    try:
+        await telegram(
+            "revokeChatInviteLink",
+            {"chat_id": CHANNEL_ID, "invite_link": invite_link},
+        )
+    except Exception:
+        pass
 
-        settings = await session.get(Settings, 1)
-        await session.commit()
+    with db() as connection:
+        connection.execute(
+            """
+            UPDATE access_links SET used = 1, revoked = 1
+            WHERE invite_link = ?
+            """,
+            (invite_link,),
+        )
+        connection.execute(
+            """
+            UPDATE users SET
+                approved_at = ?,
+                active = 1,
+                left_at = NULL
+            WHERE user_id = ?
+            """,
+            (current_time, user_id),
+        )
+        settings = connection.execute(
+            "SELECT notify_joins FROM settings WHERE id = 1"
+        ).fetchone()
+        user = connection.execute(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
 
-        if settings.notify_joins:
-            username = f"@{db_user.username}" if db_user.username else "без username"
-            await telegram("sendMessage", {
+    if settings["notify_joins"]:
+        username = f"@{user['username']}" if user["username"] else "без username"
+        await telegram(
+            "sendMessage",
+            {
                 "chat_id": ADMIN_USER_ID,
                 "text": (
                     f"✅ Новое вступление\n\n"
-                    f"Кампания: {db_user.campaign}\n"
-                    f"Пользователь: {db_user.first_name or 'Без имени'} ({username})\n"
-                    f"ID: {db_user.user_id}"
-                )
-            })
+                    f"Кампания: {user['campaign']}\n"
+                    f"Пользователь: {user['first_name'] or 'Без имени'} ({username})\n"
+                    f"Telegram ID: {user_id}"
+                ),
+            },
+        )
 
 
-async def handle_chat_member(update: dict) -> None:
-    if (update.get("chat") or {}).get("id") != CHANNEL_ID:
+async def handle_chat_member(member_update: dict) -> None:
+    if (member_update.get("chat") or {}).get("id") != CHANNEL_ID:
         return
 
-    new_member = update.get("new_chat_member") or {}
-    old_member = update.get("old_chat_member") or {}
+    new_member = member_update.get("new_chat_member") or {}
     tg_user = new_member.get("user") or {}
     if not tg_user.get("id"):
         return
 
     user_id = int(tg_user["id"])
-    new_status = new_member.get("status")
-    old_status = old_member.get("status")
-    now = utcnow()
+    status = new_member.get("status")
+    current_time = now_ts()
 
-    async with Session() as session:
-        user = await session.get(User, user_id)
+    with db() as connection:
+        user = connection.execute(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
         if not user:
             return
 
-        settings = await session.get(Settings, 1)
+        if status in {"member", "administrator", "creator"}:
+            connection.execute(
+                "UPDATE users SET active = 1, left_at = NULL WHERE user_id = ?",
+                (user_id,),
+            )
+            action = None
 
-        if new_status in {"member","administrator","creator"}:
-            user.active = True
-            user.left_at = None
+        elif status == "kicked":
+            connection.execute(
+                """
+                UPDATE users SET
+                    active = 0,
+                    left_at = ?,
+                    blocked = 1,
+                    blocked_at = ?,
+                    block_reason = 'removed_from_channel'
+                WHERE user_id = ?
+                """,
+                (current_time, current_time, user_id),
+            )
+            action = "удалён из канала"
 
-        elif new_status == "kicked":
-            # Удалён администратором: постоянный чёрный список.
-            user.active = False
-            user.left_at = now
-            user.blocked = True
-            user.blocked_at = now
-            user.block_reason = "removed_from_channel"
+        else:
+            connection.execute(
+                """
+                UPDATE users SET active = 0, left_at = ?
+                WHERE user_id = ?
+                """,
+                (current_time, user_id),
+            )
+            action = "вышел из канала"
 
-        elif new_status == "left":
-            # Сам вышел: повторный доступ всё равно запрещён правилом one-access.
-            user.active = False
-            user.left_at = now
+        settings = connection.execute(
+            "SELECT notify_leaves FROM settings WHERE id = 1"
+        ).fetchone()
 
-        await session.commit()
-
-        if settings.notify_leaves and new_status in {"left","kicked"}:
-            action = "удалён из канала" if new_status == "kicked" else "вышел из канала"
-            await telegram("sendMessage", {
+    if action and settings["notify_leaves"]:
+        await telegram(
+            "sendMessage",
+            {
                 "chat_id": ADMIN_USER_ID,
-                "text": f"🚪 Пользователь {action}\nКампания: {user.campaign}\nID: {user.user_id}"
-            })
+                "text": (
+                    f"🚪 Пользователь {action}\n"
+                    f"Кампания: {user['campaign']}\n"
+                    f"Telegram ID: {user_id}"
+                ),
+            },
+        )
 
 
 async def cleanup_loop() -> None:
     while True:
         try:
-            async with Session() as session:
-                links = (await session.execute(
-                    select(AccessLink).where(
-                        AccessLink.used.is_(False),
-                        AccessLink.revoked.is_(False),
-                        AccessLink.expires_at < utcnow(),
-                    )
-                )).scalars().all()
-                for link in links:
-                    try:
-                        await telegram("revokeChatInviteLink", {
+            current_time = now_ts()
+            with db() as connection:
+                links = connection.execute(
+                    """
+                    SELECT invite_link FROM access_links
+                    WHERE used = 0 AND revoked = 0 AND expires_at < ?
+                    """,
+                    (current_time,),
+                ).fetchall()
+
+            for row in links:
+                try:
+                    await telegram(
+                        "revokeChatInviteLink",
+                        {
                             "chat_id": CHANNEL_ID,
-                            "invite_link": link.invite_link,
-                        })
-                    except Exception:
-                        pass
-                    link.revoked = True
-                await session.commit()
+                            "invite_link": row["invite_link"],
+                        },
+                    )
+                except Exception:
+                    pass
+
+                with db() as connection:
+                    connection.execute(
+                        "UPDATE access_links SET revoked = 1 WHERE invite_link = ?",
+                        (row["invite_link"],),
+                    )
         except Exception:
             pass
+
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)

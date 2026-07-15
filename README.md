@@ -1,44 +1,55 @@
-# Declarant Admin Panel v2
+# Declarant Mini App — SQLite Ready
 
-Функции:
-- только Mini App и админ-панель, без команд;
-- создание кампаний с источником и меткой конкретного объявления;
-- топ кампаний по конверсии;
-- уведомления о вступлениях и выходах;
+Готовый проект без PostgreSQL.
+
+## Функции
+
+- Telegram Mini App для пользователей;
+- админ-панель внутри Mini App;
+- создание рекламных кампаний и ссылок;
+- метка источника и конкретного объявления;
+- статистика за 1 час, 24 часа, 7 дней и всё время;
+- топ кампаний;
+- уведомления о вступлениях, выходах и удалениях;
 - чёрный список;
-- пользователь, удалённый администратором из канала, автоматически блокируется;
-- заблокированному пользователю бот не показывает сообщения и не создаёт новые ссылки;
-- один Telegram ID получает доступ только один раз;
-- защита от пересылки приглашений;
-- автоматический отзыв старых ссылок;
-- PostgreSQL и CSV-экспорт.
+- удалённый администратором пользователь автоматически блокируется;
+- заблокированному или ранее вступавшему пользователю новые ссылки не выдаются;
+- защита от пересылки приглашения;
+- один Telegram ID — один доступ;
+- автоматический отзыв просроченных ссылок;
+- CSV-экспорт;
+- геолокация отсутствует;
+- команды отсутствуют.
 
-## Render Environment
+## Render Start Command
+
+uvicorn app:app --host 0.0.0.0 --port $PORT
+
+## Environment Variables
 
 BOT_TOKEN
 BOT_USERNAME=rbsalebot
 CHANNEL_ID=-1001322091992
 ADMIN_USER_ID=640314234
 WEBHOOK_SECRET=<длинная случайная строка>
-DATABASE_URL=<Internal Database URL PostgreSQL>
 LINK_TTL_SECONDS=600
-CLEANUP_INTERVAL_SECONDS=600
-
-Build:
-pip install -r requirements.txt
-
-Start:
-uvicorn app:app --host 0.0.0.0 --port $PORT
+CLEANUP_INTERVAL_SECONDS=300
+DB_PATH=/tmp/declarant.sqlite3
 
 ## BotFather
 
-Настрой Main Mini App:
-@BotFather → бот → Bot Settings → Configure Mini App / Main Mini App
+Настрой Main Mini App и Menu Button на URL Render:
 
-URL:
-https://ТВОЙ-СЕРВИС.onrender.com
+https://ИМЯ-СЕРВИСА.onrender.com
 
-Также настрой Menu Button на тот же URL. Тогда админ-панель открывается кнопкой меню в профиле бота, без команд.
+Рекламная ссылка создаётся в панели:
 
-Рекламные ссылки создаются внутри панели:
 https://t.me/rbsalebot?startapp=campaign_key
+
+## Ограничение SQLite на бесплатном Render
+
+Если DB_PATH находится в /tmp, база может исчезнуть после нового деплоя, перезапуска или переноса сервиса.
+
+Для сохранения базы без PostgreSQL можно позднее подключить Render Persistent Disk и изменить:
+
+DB_PATH=/var/data/declarant.sqlite3
